@@ -1,9 +1,10 @@
 //! The main formatting engine logic is in this module.
 
 use crate::config::Root;
-use crate::{config, eval_cache::CacheManifest, formatter::FormatterName};
+use crate::{config, eval_cache::CacheManifest, formatter::FormatterName, Deserialize};
 use crate::{expand_path, formatter::Formatter, get_meta, get_path_meta, FileMeta};
 use anyhow::anyhow;
+use globset::GlobSet;
 use ignore::{Walk, WalkBuilder};
 use log::{debug, error, info, warn};
 use rayon::prelude::*;
@@ -12,6 +13,10 @@ use std::io::{self, Write};
 use std::iter::Iterator;
 use std::path::{Path, PathBuf};
 use std::{collections::BTreeMap, time::Instant};
+use watchman_client::prelude::{
+    CanonicalPath, Client, Expr, FileType, MTimeField, NameField, QueryFieldList, QueryFieldName,
+    QueryRequestCommon, QueryResult, SizeField,
+};
 
 /// Controls how the information is displayed at the end of a run
 pub enum DisplayType {
@@ -21,9 +26,43 @@ pub enum DisplayType {
     Long,
 }
 
+watchman_client::query_result_type! {
+    struct WatchmanResponse {
+        name: NameField,
+        mtime: MTimeField,
+        size: SizeField,
+    }
+}
+
+// Here "path" is the absolute path that matches "includes" patterns and was changed, but that file
+// might be need to be excluded since its parent directory matches "excludes" patterns. Hence, we
+// need to iterate parent directories.
+//
+// Filesystem walker does not need this, since it would not descend into excluded directory in the
+// first place to discover a changed file that matches "includes" pattern.
+//
+// FIXME: There should be a cleaner solution.
+fn path_excluded(gs: &GlobSet, path: &PathBuf) -> bool {
+    if gs.is_match(path.file_name().expect("Does not end with `..'")) {
+        return true;
+    }
+    if gs.is_match(path) {
+        return true;
+    }
+    let mut path = path.clone();
+
+    while path.pop() {
+        if gs.is_match(&path) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Run the treefmt
 #[allow(clippy::too_many_arguments)]
-pub fn run_treefmt(
+pub async fn run_treefmt(
     tree_root: &Path,
     work_dir: &Path,
     cache_dir: &Path,
@@ -35,6 +74,7 @@ pub fn run_treefmt(
     fail_on_change: bool,
     allow_missing_formatter: bool,
     selected_formatters: &Option<Vec<String>>,
+    watchman: &Option<&Client>,
 ) -> anyhow::Result<()> {
     assert!(tree_root.is_absolute());
     assert!(work_dir.is_absolute());
@@ -89,11 +129,104 @@ pub fn run_treefmt(
         // Insert the new formatter configs
         cache.update_formatters(formatters.clone());
     }
+    stats.timed_debug("update formatters");
 
-    let walker = build_walker(paths, hidden);
+    let matches = match watchman {
+        None => {
+            let walker = build_walker(paths, hidden);
 
-    let matches = collect_matches_from_walker(walker, &formatters, &mut stats);
-    stats.timed_debug("tree walk");
+            let matches = collect_matches_from_walker(walker, &formatters, &mut stats);
+            stats.timed_debug("tree walk");
+            matches
+        }
+        Some(watchman) => {
+            let root = watchman
+                .resolve_root(CanonicalPath::with_canonicalized_path(
+                    tree_root.to_path_buf(),
+                ))
+                .await
+                .map_err(anyhow::Error::new)?;
+            stats.timed_debug("resolve root");
+
+            // FIXME: For some reason, "watchman_client" wants
+            // vector of String, not &str. There must be a better way.
+            let mut includes: Vec<String> = vec![];
+
+            for fmt in formatters.values() {
+                for pattern in fmt.includes_str.iter() {
+                    // As far as "watchman" concerned, "*.c" matches only $ROOT/foo.c, but not
+                    // $ROOT/src.foo.c
+                    let mut s = pattern.to_string();
+                    s.insert_str(0, "**/");
+
+                    includes.push(s);
+
+                    // TODO: Documentation of "watchman" suggests to use "suffix" generator instead
+                    // of "**/*.ext" one, so many common-case globs can be rewritten as suffix
+                    // queries for even more performance.
+                }
+            }
+            stats.timed_debug("clone include patterns");
+
+            let query = QueryRequestCommon {
+                glob: Some(includes),
+                glob_includedotfiles: hidden,
+                since: if !no_cache { None } else { cache.clock.clone() },
+                expression: Some(Expr::All(vec![
+                    Expr::Exists,
+                    Expr::FileType(FileType::Regular),
+                ])),
+                ..Default::default()
+            };
+            let resp: QueryResult<WatchmanResponse> = watchman
+                .query(&root, query)
+                .await
+                .map_err(anyhow::Error::new)?;
+            stats.timed_debug("watchman query");
+
+            if !no_cache {
+                cache.clock = Some(resp.clock);
+            };
+
+            let mut matches: BTreeMap<FormatterName, BTreeMap<PathBuf, FileMeta>> =
+                Default::default();
+
+            // Now the data returned by "watchman" must be massaged into the shape used by
+            // stat(2)-based branch of code. List of fields returned by "watchman" are files that
+            // (1) are changed and (2) match some glob of some formatter, but I have to figure
+            // myself to which formatter they belong. Also, "watchman" has no concept of exclusion
+            // globs, so that also must be filtered out.
+            //
+            // In addition, "watchman" returns list of files modified without respect to
+            // "paths" parameter, so that also must be post-processed.
+            for r in resp.files.unwrap_or_default().iter() {
+                let pathbuf = expand_path(&r.name.clone().into_inner(), tree_root); // FIXME: Get rid of clone().
+                match formatters.values().find(|fmt| {
+                    fmt.includes.is_match(&pathbuf) && !path_excluded(&fmt.excludes, &pathbuf)
+                }) {
+                    // Watchman is not aware of exclusion globs.
+                    None => {}
+                    Some(fmt) => {
+                        let pathbuf = expand_path(&pathbuf, tree_root);
+                        // File changed is somewhere under "paths".
+                        if paths.iter().any(|path| pathbuf.starts_with(path)) {
+                            let meta = FileMeta {
+                                size: r.size.clone().into_inner(),
+                                mtime: r.mtime.clone().into_inner(),
+                            };
+                            matches
+                                .entry(fmt.name.clone())
+                                .or_default()
+                                .insert(pathbuf, meta);
+                        }
+                    }
+                }
+            }
+            stats.timed_debug("post-process watchman list");
+            matches
+        }
+    };
+    stats.timed_debug("finish walking");
 
     // Filter out all of the paths that were already in the cache
     let matches = if !no_cache {

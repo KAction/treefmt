@@ -88,6 +88,11 @@ pub struct Formatter {
     pub work_dir: PathBuf,
     /// File or Folder that is included to be formatted
     pub includes: GlobSet,
+    /// The string representation of glob patterns that was used
+    /// to build `includes` member to be used to query `watchman(1).
+    ///
+    /// There is no interface to decompile `GlobSet`.
+    pub includes_str: Vec<String>,
     /// File or Folder that is excluded to be formatted
     pub excludes: GlobSet,
 }
@@ -191,6 +196,8 @@ impl Formatter {
             options: cfg.options.clone(),
             work_dir,
             includes,
+            // TODO: Avoid clone().
+            includes_str: cfg.includes.clone(),
             excludes,
         })
     }
